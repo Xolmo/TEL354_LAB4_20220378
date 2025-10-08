@@ -1,5 +1,5 @@
 # ========================================================
-# appSDN.py — Control de red SDN (modo proactivo con CRUD + Conexiones + Flows)
+# appSDN.py — Control de red SDN
 # ========================================================
 
 import yaml
