@@ -38,7 +38,7 @@ servidores:
          servicios: 
              - nombre: ssh
                protocolo: TCP
-               puerto: 23
+               puerto: 22
              - nombre: web
                protocolo: TCP
                puerto: 80

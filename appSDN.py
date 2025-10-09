@@ -1,12 +1,13 @@
 # ========================================================
-# appSDN.py — Control de red SDN
+# appSDN.py Control de red SDN
 # ========================================================
 
 import yaml
 import requests
-import time
+import re
 from clases import Alumno, Curso, Servidor, Servicio
-from requests_example import get_attachement_points, get_route
+from requests_example import get_route
+import uuid
 
 FLOODLIGHT = "http://10.20.12.150:8080"
 STATIC_FLOW_PUSHER = f"{FLOODLIGHT}/wm/staticflowpusher/json"
@@ -46,16 +47,34 @@ def get_host_info_by_mac(mac):
     return None, None, [], []
 
 def get_host_info_by_ip(ipv4):
-    """Devuelve (dpid, port, ipv4_list, mac_list) para un host a partir de su IP."""
-    r = requests.get(DEVICE_API, timeout=TIMEOUT)
-    r.raise_for_status()
-    for dev in r.json():
-        ips = [i for i in dev.get("ipv4", [])]
-        if ipv4 in ips:
-            ap = dev.get("attachmentPoint", [])
+    """Devuelve (dpid, port, ipv4_list, mac_list) para un host a partir de su IP (robusto para Floodlight)."""
+    try:
+        r = requests.get(DEVICE_API, timeout=TIMEOUT)
+        r.raise_for_status()
+        devices = r.json()
+    except Exception as e:
+        raise RuntimeError(f"No se pudo consultar {DEVICE_API}: {e}")
+
+    for dev in devices:
+        # Compatibilidad con distintos nombres de campos
+        ipv4s = dev.get("ipv4", []) or dev.get("ipv4Addresses", [])
+        macs = dev.get("mac", []) or dev.get("macAddresses", [])
+        ap = dev.get("attachmentPoint", []) or dev.get("attachmentPoints", [])
+
+        # Comparar IP exacta
+        if ipv4 in ipv4s:
             if ap:
-                return ap[0].get("switchDPID"), ap[0].get("port"), ips, dev.get("mac", [])
+                ap0 = ap[0]
+                dpid = ap0.get("switchDPID") or ap0.get("switch") or ap0.get("dpid")
+                port = ap0.get("port") or ap0.get("portNumber")
+                return dpid, port, ipv4s, macs
+
+    # Si no se encontró, mostrar info útil
+    print(f"⚠️ No se encontró el host con IP {ipv4}. Hosts detectados:")
+    for dev in devices:
+        print(f"  - IPs: {dev.get('ipv4', [])} | MACs: {dev.get('mac', [])} | AP: {dev.get('attachmentPoint', [])}")
     return None, None, [], []
+
 
 def ip_proto_number(proto_name: str) -> int:
     p = proto_name.strip().upper()
@@ -180,7 +199,7 @@ def alumno_autorizado(alumno, servidor, servicio, cursos):
 
 
 # ========================================================
-# FLOW PUSHER (instalación/eliminación de flows)
+# FLOW PUSHER (instalacion/eliminacion de flows)
 # ========================================================
 def push_flow(flow_name, switch_dpid, match, out_port, priority=32768):
     body = {
@@ -214,7 +233,10 @@ def delete_flow(flow_name):
 # CONSTRUCCIÓN DE RUTA Y FLOWS
 # ========================================================
 def _install_ip_flows_for_hop(switch, in_port, out_port, src_ip, dst_ip, proto_num, l4_dst_port, flow_tag):
-    # IPv4 forward (host -> server)
+    """
+    Instala flows IPv4 para TCP/UDP y siempre ICMP, con dirección correcta en ambos sentidos.
+    """
+    # --- FORWARD (host → servidor) ---
     match_fwd = {
         "in_port": str(in_port),
         "eth_type": "0x0800",
@@ -228,7 +250,7 @@ def _install_ip_flows_for_hop(switch, in_port, out_port, src_ip, dst_ip, proto_n
         match_fwd["udp_dst"] = str(l4_dst_port)
     push_flow(f"{flow_tag}-ip-fwd", switch, match_fwd, out_port, priority=40000)
 
-    # IPv4 reverse (server -> host)
+    # --- REVERSE (servidor → host) ---
     match_rev = {
         "in_port": str(out_port),
         "eth_type": "0x0800",
@@ -240,7 +262,9 @@ def _install_ip_flows_for_hop(switch, in_port, out_port, src_ip, dst_ip, proto_n
         match_rev["tcp_src"] = str(l4_dst_port)
     elif proto_num == 17:
         match_rev["udp_src"] = str(l4_dst_port)
+    #La salida del flujo reverse debe ser el puerto de entrada original
     push_flow(f"{flow_tag}-ip-rev", switch, match_rev, in_port, priority=40000)
+
 
 def _install_arp_flows_for_hop(switch, in_port, out_port, flow_tag):
     # ARP in both directions (no IP match)
@@ -256,60 +280,247 @@ def _install_arp_flows_for_hop(switch, in_port, out_port, flow_tag):
     }
     push_flow(f"{flow_tag}-arp-rev", switch, match_arp_rev, in_port, priority=45000)
 
-def build_route(alumno, servidor, servicio):
-    # Resolver IPs y puntos de acceso
-    dpid_src, port_src, ips_src, _ = get_host_info_by_mac(alumno.pc)
-    if not dpid_src or not port_src:
-        raise RuntimeError("No se encontró attachment point del alumno")
 
-    # intentar encontrar el servidor por IP conocida (propiedad del objeto servidor)
-    dpid_dst, port_dst, ips_dst, _ = get_host_info_by_ip(servidor.direccion_ip)
-    if not dpid_dst or not port_dst:
-        raise RuntimeError("No se encontró attachment point del servidor")
+def build_route(alumno, servidor, servicio_nombre):
+    # --- Sanitizar nombres (sin espacios ni caracteres especiales) ---
+    safe_alumno = re.sub(r'[^a-zA-Z0-9_-]', '_', alumno.nombre)
+    safe_servidor = re.sub(r'[^a-zA-Z0-9_-]', '_', servidor.nombre)
+    safe_servicio = re.sub(r'[^a-zA-Z0-9_-]', '_', servicio_nombre)
 
-    # Determinar IPs (toma la primera del host si no hay otra especificada)
-    ip_src = ips_src[0] if ips_src else None
-    ip_dst = servidor.direccion_ip  # ya la tenemos
-    if not ip_src or not ip_dst:
-        raise RuntimeError("No se pudieron determinar las IPs del host o servidor")
+    # --- Obtener información de los extremos ---
+    dpid_al, port_al, ipv4_al, mac_al = get_host_info_by_mac(alumno.pc)
+    if not dpid_al or not ipv4_al:
+        print(f"No se encontró info por MAC para {alumno.nombre}, intentando por IP...")
+        # Si tienes IP registrada en el alumno (opcional), puedes intentar:
+        if hasattr(alumno, "ip"):
+            dpid_al, port_al, ipv4_al, mac_al = get_host_info_by_ip(alumno.ip)
+    if not dpid_al or not ipv4_al:
+        raise RuntimeError(f"No se pudo obtener info de {alumno.nombre}")
 
-    # Determinar protocolo y puerto L4 a partir del servicio
-    svc_obj = next((s for s in servidor.servicios if s.nombre.lower() == servicio.lower()), None)
-    if not svc_obj:
-        raise RuntimeError("El servidor no expone el servicio solicitado")
-    proto_num = ip_proto_number(svc_obj.protocolo)
-    l4_dst_port = int(svc_obj.puerto)
+    dpid_srv, port_srv, ipv4_srv, mac_srv = get_host_info_by_ip(servidor.direccion_ip)
+    if not dpid_srv or not ipv4_srv:
+        raise RuntimeError(f"No se pudo obtener info de {servidor.nombre}")
 
-    # Obtener ruta
-    ruta = get_route(dpid_src, port_src, dpid_dst, port_dst)
+    ip_src = ipv4_al[0]
+    ip_dst = ipv4_srv[0]
 
-    # Instalar flows por cada salto
-    created = []
-    for i, hop in enumerate(ruta):
-        sw = hop["src-switch"] if isinstance(hop, dict) else hop[0]
-        in_p = hop["src-port"] if isinstance(hop, dict) else hop[1]
-        out_p = hop["dst-port"] if isinstance(hop, dict) else hop[3]
+    # --- Servicio y protocolo ---
+    svc = next((s for s in servidor.servicios if s.nombre.lower() == servicio_nombre.lower()), None)
+    if not svc:
+        raise RuntimeError(f"El servidor {servidor.nombre} no tiene el servicio {servicio_nombre}")
+    proto_num = ip_proto_number(svc.protocolo)
+    puerto_l4 = svc.puerto
 
-        tag = f"{alumno.nombre}-{servidor.nombre}-hop{i}"
-        _install_ip_flows_for_hop(sw, in_p, out_p, ip_src, ip_dst, proto_num, l4_dst_port, tag)
-        _install_arp_flows_for_hop(sw, in_p, out_p, tag)
-        created.append(tag)
+    # --- Obtener ruta desde Floodlight ---
+    ruta = get_route(dpid_al, port_al, dpid_srv, port_srv)
+    if not ruta or not isinstance(ruta, list):
+        raise RuntimeError("No se pudo obtener una ruta válida entre alumno y servidor")
 
-    print(f"Instalada ruta con {len(ruta)} saltos entre {alumno.nombre} → {servidor.nombre}")
-    return created
+    # --- Procesar ruta ---
+    hops = []
+    for hop in ruta:
+        sw_src = hop["src-switch"]
+        sw_dst = hop["dst-switch"]
+        p_src = hop["src-port"]
+        p_dst = hop["dst-port"]
+
+        if sw_src == sw_dst:
+            hops.append({"switch": sw_src, "in_port": p_src, "out_port": p_dst})
+
+    # Agregar entrada inicial (host → switch origen)
+    if hops and hops[0]["switch"] != dpid_al:
+        hops.insert(0, {"switch": dpid_al, "in_port": port_al, "out_port": ruta[0]["src-port"]})
+
+    # Agregar salida final (switch destino → servidor)
+    if hops and hops[-1]["switch"] != dpid_srv:
+        hops.append({"switch": dpid_srv, "in_port": ruta[-1]["dst-port"], "out_port": port_srv})
+
+    # --- Instalar flows en cada hop ---
+    all_flows = []
+    for i, hop in enumerate(hops):
+        sw = hop["switch"]
+        in_port = hop["in_port"]
+        out_port = hop["out_port"]
+        tag = f"{safe_alumno}-{safe_servidor}-{safe_servicio}-s{i}"
+
+        # Flujos IP bidireccionales
+        _install_ip_flows_for_hop(sw, in_port, out_port, ip_src, ip_dst, proto_num, puerto_l4, tag)
+        # Flujos ARP bidireccionales
+        _install_arp_flows_for_hop(sw, in_port, out_port, tag)
+
+        # Registrar nombres exactos de los flows creados
+        all_flows.extend([
+            f"{tag}-ip-fwd", f"{tag}-ip-rev",
+            f"{tag}-arp-fwd", f"{tag}-arp-rev"
+        ])
+
+    print(f"{len(all_flows)} flows instalados correctamente para {alumno.nombre} ↔ {servidor.nombre}:{servicio_nombre}")
+    return all_flows
+
+def crear_conexion_handler(alumno, servidor, servicio, cursos):
+
+    # --- Validar autorización ---
+    if not alumno_autorizado(alumno, servidor, servicio, cursos):
+        print("Acceso denegado: el alumno no está autorizado según las políticas.")
+        print("Debe pertenecer a un curso DICTANDO que incluya este servidor y servicio permitido.")
+        return None
+
+    # --- Generar identificador único (handler) ---
+    connection_id = f"CONN-{uuid.uuid4().hex[:8]}"
+    safe_alumno = re.sub(r'[^a-zA-Z0-9_-]', '_', alumno.nombre)
+    safe_servidor = re.sub(r'[^a-zA-Z0-9_-]', '_', servidor.nombre)
+    safe_servicio = re.sub(r'[^a-zA-Z0-9_-]', '_', servicio)
+    flow_prefix = f"{safe_alumno}-{safe_servidor}-{safe_servicio}"
+
+    print(f"\nCreando conexión {connection_id} → {flow_prefix} ...")
+
+    try:
+        # --- Instalar los flows y registrar sus nombres ---
+        flow_names = build_route(alumno, servidor, servicio)
+
+        if flow_names:
+            print(f"Conexión creada con éxito.")
+            print(f"   Handler: {connection_id}")
+            print(f"   Prefijo: {flow_prefix}")
+            print(f"   Flows registrados: {len(flow_names)}")
+
+            # --- Registrar conexión en memoria global ---
+            if "conexiones" not in globals():
+                globals()["conexiones"] = []
+            globals()["conexiones"].append({
+                "id": connection_id,
+                "alumno": alumno.nombre,
+                "servidor": servidor.nombre,
+                "servicio": servicio,
+                "prefijo": flow_prefix,
+                "flows": flow_names  
+            })
+
+            return connection_id
+        else:
+            print("No se pudo establecer la conexión (sin flows instalados).")
+            return None
+
+    except Exception as e:
+        print(f"Error al crear la conexión: {e}")
+        return None
+
+
+def listar_conexiones():
+    if "conexiones" not in globals() or not globals()["conexiones"]:
+        print("\nNo hay conexiones registradas actualmente.")
+        return
+
+    print("\n=== LISTA DE CONEXIONES ACTIVAS ===")
+    for i, conn in enumerate(globals()["conexiones"], start=1):
+        print(f"\n#{i}")
+        print(f"Handler: {conn['id']}")
+        print(f"Alumno: {conn['alumno']}")
+        print(f"Servidor: {conn['servidor']}")
+        print(f"Servicio: {conn['servicio']}")
+        print(f"Prefijo de flows: {conn['prefijo']}")
+
+def mostrar_detalle_conexion(handler_id):
+    if "conexiones" not in globals() or not globals()["conexiones"]:
+        print("\nNo hay conexiones registradas actualmente.")
+        return
+
+    # Buscar conexión por handler
+    conn = next((c for c in globals()["conexiones"] if c["id"] == handler_id), None)
+
+    if not conn:
+        print(f"No se encontró ninguna conexión con el handler '{handler_id}'.")
+        return
+
+    print("\n=== DETALLES DE LA CONEXIÓN ===")
+    print(f"Handler: {conn['id']}")
+    print(f"Alumno: {conn['alumno']}")
+    print(f"Servidor: {conn['servidor']}")
+    print(f"Servicio: {conn['servicio']}")
+    print(f"Prefijo de flows: {conn['prefijo']}")
+
+
+def recalcular_conexion(handler_id, alumnos, servidores, cursos):
+    if "conexiones" not in globals() or not globals()["conexiones"]:
+        print("\nNo hay conexiones registradas actualmente.")
+        return
+
+    # Buscar conexión por handler
+    conn = next((c for c in globals()["conexiones"] if c["id"] == handler_id), None)
+    if not conn:
+        print(f"No se encontró ninguna conexión con el handler '{handler_id}'.")
+        return
+
+    # Obtener referencias actuales (por nombre)
+    alumno = next((a for a in alumnos if a.nombre == conn["alumno"]), None)
+    servidor = next((s for s in servidores if s.nombre == conn["servidor"]), None)
+    servicio = conn["servicio"]
+
+    if not alumno or not servidor:
+        print("No se pudo encontrar al alumno o servidor original.")
+        return
+
+    print(f"\nRecalculando conexión {handler_id} ...")
+    print(f"{alumno.nombre} ↔ {servidor.nombre}:{servicio}")
+
+    # Validar autorización antes de reinstalar
+    if not alumno_autorizado(alumno, servidor, servicio, cursos):
+        print("Acceso denegado: el alumno ya no cumple las políticas de acceso.")
+        print("No se reinstalarán los flows.")
+        return
+
+    try:
+        ok = build_route(alumno, servidor, servicio)
+        if ok:
+            print(f"Ruta recalculada e instalada correctamente.")
+        else:
+            print(f"No se pudo obtener una ruta válida desde Floodlight.")
+    except Exception as e:
+        print(f"Error al recalcular la conexión: {e}")
+
+def eliminar_conexion_handler(handler_id):
+    """
+    Elimina los flows asociados a una conexión usando su lista de nombres registrados.
+    """
+    if "conexiones" not in globals() or not globals()["conexiones"]:
+        print("\nNo hay conexiones registradas actualmente.")
+        return
+
+    conn = next((c for c in globals()["conexiones"] if c["id"] == handler_id), None)
+    if not conn:
+        print(f"No se encontró ninguna conexión con el handler '{handler_id}'.")
+        return
+
+    flow_names = conn.get("flows", [])
+    if not flow_names:
+        print(f"La conexión {handler_id} no tiene flows registrados.")
+    else:
+        print(f"\nEliminando conexión {handler_id} ...")
+        for name in flow_names:
+            try:
+                _http_delete(STATIC_FLOW_PUSHER, {"name": name})
+                print(f"   Flow eliminado: {name}")
+            except Exception as e:
+                print(f"   Error al eliminar {name}: {e}")
+        print(f"{len(flow_names)} flows eliminados correctamente.")
+
+    # Remover del registro global
+    globals()["conexiones"] = [c for c in globals()["conexiones"] if c["id"] != handler_id]
+    print("Conexión eliminada del registro local.")
 
 
 # ========================================================
 # CRUD Y SUBMENÚS
 # ========================================================
-def menu_alumnos(alumnos):
+def menu_alumnos(alumnos, cursos):
     while True:
         print("\n--- GESTIÓN DE ALUMNOS ---")
         print("1) Crear alumno")
         print("2) Listar alumnos")
-        print("3) Actualizar alumno")
-        print("4) Eliminar alumno")
-        print("5) Volver")
+        print("3) Ver detalles de un alumno")
+        print("4) Actualizar alumno")
+        print("5) Eliminar alumno")
+        print("6) Volver")
         op = input("Seleccione: ").strip()
         if op == "1":
             nombre = input("Nombre: ")
@@ -329,6 +540,24 @@ def menu_alumnos(alumnos):
                 cod_str = f" | código: {cod}" if cod else ""
                 print(f"- {a.nombre} (MAC {a.pc}){cod_str}")
         elif op == "3":
+            nombre = input("Nombre del alumno: ").strip()
+            a = next((x for x in alumnos if x.nombre == nombre), None)
+            if not a:
+                print("Alumno no encontrado.")
+            else:
+                print(f"\n=== Detalles del alumno {a.nombre} ===")
+                cod = getattr(a, "codigo", "N/A")
+                print(f"Código: {cod}")
+                print(f"MAC: {a.pc}")
+                # Mostrar cursos donde está matriculado
+                cursos_asociados = [c.nombre for c in cursos if a in c.alumnos]
+                if cursos_asociados:
+                    print("Cursos matriculados:")
+                    for cn in cursos_asociados:
+                        print(f" - {cn}")
+                else:
+                    print("No está matriculado en ningún curso.")
+        elif op == "4":
             nombre = input("Alumno a actualizar: ")
             a = next((x for x in alumnos if x.nombre == nombre), None)
             if not a:
@@ -341,11 +570,11 @@ def menu_alumnos(alumnos):
             if mac: a.pc = mac
             if cod: setattr(a, "codigo", cod)
             print("Actualizado.")
-        elif op == "4":
+        elif op == "5":
             nombre = input("Alumno a eliminar: ")
             alumnos[:] = [x for x in alumnos if x.nombre != nombre]
             print("Eliminado.")
-        elif op == "5":
+        elif op == "6":
             break
         else:
             print("Opción inválida.")
@@ -356,11 +585,12 @@ def menu_cursos(cursos, servidores, alumnos):
         print("\n--- GESTIÓN DE CURSOS ---")
         print("1) Crear curso")
         print("2) Listar cursos")
-        print("3) Actualizar estado")
-        print("4) Gestionar matrícula")
-        print("5) Gestionar servidores/servicios permitidos")
-        print("6) Eliminar curso")
-        print("7) Volver")
+        print("3) Ver detalles de un curso")
+        print("4) Actualizar estado")
+        print("5) Gestionar matrícula")
+        print("6) Gestionar servidores/servicios permitidos")
+        print("7) Eliminar curso")
+        print("8) Volver")
         op = input("Seleccione: ").strip()
         if op == "1":
             nombre = input("Nombre: ")
@@ -378,6 +608,32 @@ def menu_cursos(cursos, servidores, alumnos):
                 for srv in c.servidores:
                     print(f"   * {srv.nombre} → permitidos: {sp.get(srv.nombre, [])}")
         elif op == "3":
+            nombre = input("Nombre del curso: ").strip()
+            c = next((x for x in cursos if x.nombre == nombre), None)
+            if not c:
+                print("Curso no encontrado.")
+            else:
+                print(f"\n=== Detalles del curso {c.nombre} ===")
+                print(f"Estado: {c.estado}")
+                print(f"Alumnos matriculados: {len(c.alumnos)}")
+                if c.alumnos:
+                    for a in c.alumnos:
+                        cod = getattr(a, "codigo", "")
+                        cod_str = f" | código: {cod}" if cod else ""
+                        print(f"   - {a.nombre}{cod_str}")
+                else:
+                    print("   (Sin alumnos)")
+
+                print(f"\nServidores asociados: {len(c.servidores)}")
+                sp = getattr(c, "servicios_permitidos", {})
+                for s in c.servidores:
+                    print(f"   - {s.nombre}")
+                    permitidos = sp.get(s.nombre, [])
+                    if permitidos:
+                        print(f"     Servicios permitidos: {', '.join(permitidos)}")
+                    else:
+                        print("     (Ninguno permitido)")
+        elif op == "4":
             nombre = input("Curso a actualizar: ")
             c = next((x for x in cursos if x.nombre == nombre), None)
             if not c:
@@ -387,7 +643,7 @@ def menu_cursos(cursos, servidores, alumnos):
             if estado:
                 c.estado = estado
                 print("Estado actualizado.")
-        elif op == "4":
+        elif op == "5":
             nombre = input("Curso: ")
             c = next((x for x in cursos if x.nombre == nombre), None)
             if not c:
@@ -408,7 +664,7 @@ def menu_cursos(cursos, servidores, alumnos):
                 nombre_al = input("Alumno a retirar: ")
                 c.alumnos = [x for x in c.alumnos if x.nombre != nombre_al]
                 print("Retirado")
-        elif op == "5":
+        elif op == "6":
             nombre = input("Curso: ")
             c = next((x for x in cursos if x.nombre == nombre), None)
             if not c:
@@ -452,11 +708,11 @@ def menu_cursos(cursos, servidores, alumnos):
                 else:
                     print("No existía ese permiso.")
             setattr(c, "servicios_permitidos", sp)
-        elif op == "6":
+        elif op == "7":
             nombre = input("Curso a eliminar: ")
             cursos[:] = [x for x in cursos if x.nombre != nombre]
             print("Eliminado (si existía).")
-        elif op == "7":
+        elif op == "8":
             break
         else:
             print("Opción inválida.")
@@ -541,50 +797,44 @@ def menu_servidores(servidores):
 def menu_conexiones(alumnos, cursos, servidores):
     while True:
         print("\n--- GESTIÓN DE CONEXIONES ---")
-        print("1) Crear conexión (instala flows)")
-        print("2) Eliminar flows por prefijo de nombre (best-effort)")
-        print("3) Volver")
+        print("1) Crear conexión")
+        print("2) Listar conexiones")
+        print("3) Mostrar detalle")
+        print("4) Recalcular conexión")
+        print("5) Eliminar conexión")
+        print("6) Volver")
         op = input("Seleccione: ").strip()
         if op == "1":
+            print("\n--- CREAR CONEXIÓN ---")
             nombre_al = input("Alumno: ").strip()
             alumno = next((a for a in alumnos if a.nombre == nombre_al), None)
             if not alumno:
                 print("Alumno no encontrado.")
                 continue
-
             nombre_srv = input("Servidor: ").strip()
             servidor = next((s for s in servidores if s.nombre == nombre_srv), None)
             if not servidor:
                 print("Servidor no encontrado.")
                 continue
-
-            servicio = input("Servicio (ej. ssh/web): ").strip()
-
-            # Políticas
-            if not alumno_autorizado(alumno, servidor, servicio, cursos):
-                print("Acceso denegado según las políticas (curso DICTANDO + servidor + servicio permitido).")
-                continue
-
-            try:
-                tags = build_route(alumno, servidor, servicio)
-                print("Flows instalados. Prefijo de nombres:", f"{alumno.nombre}-{servidor.nombre}-")
-            except Exception as e:
-                print(f"Error al crear conexión: {e}")
-
+            servicio = input("Servicio (ej. ssh/web): ").strip().lower()
+            # --- Crear conexión con handler ---
+            handler = crear_conexion_handler(alumno, servidor, servicio, cursos)
+            if handler:
+                print(f"Handler registrado: {handler}")
+            else:
+                print("No se pudo crear la conexión.")
         elif op == "2":
-            pref = input("Ingrese prefijo de nombre de flows (ej. Alumno-Servidor-): ").strip()
-            print("Eliminación best-effort: Debe conocer los nombres exactos si su Floodlight no soporta wildcard.")
-            print("Ingrese los nombres exactos (uno por línea). Fin con línea vacía.")
-            names = []
-            while True:
-                n = input("> ").strip()
-                if not n:
-                    break
-                names.append(n)
-            for n in names:
-                ok = delete_flow(n)
-                print(f"- {n}: {'OK' if ok else 'No se pudo (verifique soporte DELETE)'}")
+            listar_conexiones()
         elif op == "3":
+            handler_id = input("Ingrese el handler de la conexión: ").strip()
+            mostrar_detalle_conexion(handler_id)
+        elif op == "4":
+            handler_id = input("Ingrese el handler de la conexión a recalcular: ").strip()
+            recalcular_conexion(handler_id, alumnos, servidores, cursos)
+        elif op == "5":
+            handler_id = input("Ingrese el handler de la conexión a eliminar: ").strip()
+            eliminar_conexion_handler(handler_id)
+        elif op == "6":
             break
         else:
             print("Opción inválida.")
@@ -622,7 +872,7 @@ def menu(alumnos, cursos, servidores):
         elif op == "3":
             menu_cursos(cursos, servidores, alumnos)
         elif op == "4":
-            menu_alumnos(alumnos)
+            menu_alumnos(alumnos, cursos)
         elif op == "5":
             menu_servidores(servidores)
         elif op == "6":
